@@ -41,7 +41,7 @@ Six skills share a name across flavors (`full-send`, `full-stop`, `council`,
 directory**. Put your main forge globally and the other one per project.
 
 ```bash
-git clone <this repo> ~/Code/forgestack
+git clone https://github.com/Wozacosta/forgestack ~/Code/forgestack
 
 # Global, GitHub flavor
 cp -R ~/Code/forgestack/skills/github/* ~/.claude/skills/   # Claude Code
