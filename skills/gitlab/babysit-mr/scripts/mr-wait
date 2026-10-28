@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""mr-wait: watch one GitLab merge request and print one line per real event.
+
+  mr-wait <mr> [--repo group/project] [--hostname host] [--until green|ready|any-change] [--interval 20]
+
+<mr> is an MR number (`!123` works) or an MR URL. Without --repo, the project
+comes from the URL or from the current checkout, and the host comes from the
+URL, --hostname, or glab's default for the current directory. Stdout carries
+only events, one line each, so a monitor (Claude Code's Monitor tool) wakes the
+agent once per real event. Progress and errors that do not end the run go to
+stderr.
+
+--until
+  green       the head pipeline succeeded on the current head (or the project
+              has no CI and does not require a pipeline)
+  ready       green, Greptile or GitLab Duo reviewed the current head, and no
+              thread is unresolved (default)
+  any-change  stop after the first poll that prints an event
+
+Exit codes
+  0  the --until condition is met, or the MR merged
+  1  the condition cannot be met without action: the pipeline failed or waits
+     on a manual job, the MR conflicts with its target, the MR closed, `ready`
+     is blocked by unresolved threads or a required rebase, or GitLab stayed
+     unreachable
+  2  bad arguments, unknown MR, or another mr-wait already watches this MR
+
+Events
+  - a job failed in the head pipeline (name and link), or the pipeline failed
+  - the head pipeline finished (one summary line)
+  - a new comment, thread, or thread reply from someone other than the MR
+    author or the glab user
+  - an approval, or a reviewer requesting changes
+  - Greptile, GitLab Duo, or CodeRabbit finished on the head, or a Greptile or
+    Duo summary changed after that
+  - the target branch moved and the new commits touch files in this MR
+  - the MR started to conflict, or GitLab requires a rebase
+  - the MR merged or closed
+
+GitLab has no per-job required checks: the head pipeline's status is the gate,
+and jobs with `allow_failure: true` never fail it. CodeRabbit is advisory:
+mr-wait reports it but never waits for it. Comment edits and system notes are
+never events, and comments from CI and deploy bots are skipped, because the
+pipeline already carries that news.
+
+A bot counts as having reviewed the head when one of its diff notes is on the
+head commit, a summary note names the head SHA, or it posted after the head was
+pushed. With merged results pipelines the pipeline runs on a merge commit, so a
+pipeline created before the head was pushed counts as stale.
+
+State lives in ~/.local/state/mr-wait/. A lock makes a second watcher for the
+same MR exit at once. A state file lets a restarted watcher report what arrived
+while no watcher ran. The first run for an MR records what already exists and
+reports only what comes after.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any, NoReturn
+from urllib.parse import quote
+
+# Matched against a note author's username and display name, or a job name.
+GATING_BOTS = {"greptile": r"greptile", "duo": r"^gitlab[-_ ]?duo|duo[-_ ]?code[-_ ]?review"}
+ADVISORY_BOTS = {"coderabbit": r"coderabbit"}
+# CI and deploy bots report through pipelines. Their MR comments are status reports.
+STATUS_BOTS = ("gitlab-bot", "vercel", "netlify", "railway", "cloudflare", "renovate", "dependabot")
+STATE_DIR = Path.home() / ".local" / "state" / "mr-wait"
+# A state file older than this describes an old session. Start a fresh baseline
+# instead of replaying hours of comments as new events.
+STALE_STATE_SECONDS = 6 * 3600
+MAX_FAILED_POLLS = 10
+# Polls with no pipeline before a project that does not require one counts as green.
+NO_PIPELINE_POLLS = 3
+# Pipelines and diff versions are both created after a push, in either order.
+PUSH_SKEW_SECONDS = 60
+PER_PAGE = 100
+TRANSIENT = re.compile(
+    r"HTTP (5\d\d|429)|\b(500|502|503|504|429)\b|rate limit|timed? ?out|connection (reset|refused)|EOF|"
+    r"temporar|could not resolve host|TLS handshake|Something went wrong",
+    re.IGNORECASE,
+)
+PASSED = ("success", "skipped")
+FAILED = ("failed", "canceled", "canceling")
+BLOCKED = ("manual",)
+# Job statuses, worst first. A retried job keeps only its latest run.
+RANK = {"failed": 5, "canceled": 4, "manual": 3, "running": 2, "pending": 2, "created": 2, "success": 1, "skipped": 0}
+
+Json = dict[str, Any]
+
+
+class GlabError(Exception):
+    def __init__(self, message: str, transient: bool) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+def log(message: str) -> None:
+    print(f"mr-wait: {message}", file=sys.stderr, flush=True)
+
+
+def fail(message: str, code: int = 2) -> NoReturn:
+    # Fatal messages go to stdout so a monitor shows the agent why it stopped.
+    print(f"mr-wait: {message}", flush=True)
+    sys.exit(code)
+
+
+def glab_api(endpoint: str, host: str | None) -> Any:
+    """GET one endpoint. Retries transient failures (HTTP 5xx or 429, network) with backoff."""
+    args = ["glab", "api", *(["--hostname", host] if host else []), endpoint]
+    delay = 2
+    for attempt in range(5):
+        proc = subprocess.run(args, capture_output=True, text=True)
+        transient = proc.returncode != 0 and bool(TRANSIENT.search(proc.stderr))
+        if proc.returncode == 0:
+            try:
+                return json.loads(proc.stdout)
+            except ValueError as error:
+                raise GlabError(f"bad JSON from {endpoint}: {error}", False) from None
+        lines = [line.strip() for line in proc.stderr.strip().splitlines() if line.strip()]
+        message = " ".join(lines[-3:]) if lines else f"glab exited {proc.returncode}"
+        if not transient or attempt == 4:
+            raise GlabError(message, transient)
+        log(f"glab api {endpoint.split('?')[0]}: {message}; retry in {delay}s")
+        time.sleep(delay)
+        delay *= 2
+    raise AssertionError("unreachable")
+
+
+def bot_name(*texts: str | None, bots: dict[str, str] | None = None) -> str | None:
+    """Which review bot a username, display name, or job name belongs to, if any."""
+    table = bots or {**GATING_BOTS, **ADVISORY_BOTS}
+    for text in texts:
+        lowered = (text or "").lower()
+        for bot, pattern in table.items():
+            if lowered and re.search(pattern, lowered):
+                return bot
+    return None
+
+
+def who(note: Json) -> tuple[str, str]:
+    author = note.get("author") or {}
+    return author.get("username") or "ghost", author.get("name") or ""
+
+
+def note_bot(note: Json) -> str | None:
+    return bot_name(*who(note))
+
+
+def plain(body: str) -> str:
+    body = re.sub(r"<!--.*?-->", " ", body or "", flags=re.DOTALL)
+    return html.unescape(re.sub(r"<[^>]+>", " ", body))
+
+
+def snippet(body: str, limit: int = 100) -> str:
+    text = re.sub(r"\s+", " ", plain(body)).strip()
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def verdict(body: str) -> str:
+    """The verdict line of a bot summary (Greptile, Duo), if it has one."""
+    for line in plain(body).splitlines():
+        if re.search(r"verdict|confidence score", line, re.IGNORECASE):
+            return snippet(line.replace("*", ""), 80)
+    return ""
+
+
+def digest(body: str) -> str:
+    return hashlib.sha1(re.sub(r"\s+", " ", plain(body)).encode()).hexdigest()[:12]
+
+
+def stamp(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def parse_target(raw: str | None, repo: str | None, host: str | None) -> tuple[str, str | None, int]:
+    if raw is None or not raw.strip():
+        fail("missing MR number. Did a variable expand to nothing? Usage: mr-wait <mr> [--repo group/project]")
+    url = re.fullmatch(r"https?://([^/\s]+)/(.+?)/-/merge_requests/(\d+)(?:[/?#]\S*)?", raw.strip())
+    number = re.fullmatch(r"[!#]?(\d+)", raw.strip())
+    if url:
+        host = host or url.group(1)
+        repo = repo or url.group(2)
+        iid = int(url.group(3))
+    elif number:
+        iid = int(number.group(1))
+    else:
+        fail(f"'{raw}' is not an MR number or MR URL")
+    if iid <= 0:
+        fail(f"'{raw}' is not a valid MR number")
+    if not repo:
+        try:
+            repo = glab_api("projects/:id", host)["path_with_namespace"]
+        except (GlabError, KeyError, TypeError) as error:
+            fail(f"no --repo given and the current directory has no GitLab project ({error})")
+    if not re.fullmatch(r"[\w.-]+(/[\w.-]+)+", repo):
+        fail(f"'{repo}' is not group/project")
+    try:
+        glab_api(f"projects/{quote(repo, safe='')}/merge_requests/{iid}", host)
+    except GlabError as error:
+        if not error.transient:  # a transient failure is retried by the poll loop
+            fail(f"cannot read {repo}!{iid}: {error}")
+    return repo, host, iid
+
+
+def state_key(repo: str, host: str | None, iid: int) -> str:
+    return f"{host or 'default'}__{repo.replace('/', '__')}__{iid}"
+
+
+def lock(key: str, label: str) -> Any:
+    """Hold a per-MR lock for the life of the process. The OS drops it on exit."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(STATE_DIR / f"{key}.lock", "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        pid = handle.read().strip() or "unknown"
+        fail(
+            f"pid {pid} already watches {label}, so this watcher exits to avoid "
+            f"duplicate events. If no events reach you from it, run `kill {pid}` and start again."
+        )
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
+class Watcher:
+    def __init__(self, repo: str, host: str | None, iid: int, until: str, interval: int) -> None:
+        self.repo, self.host, self.iid, self.until, self.interval = repo, host, iid, until, interval
+        self.project = f"projects/{quote(repo, safe='')}"
+        self.mr_path = f"{self.project}/merge_requests/{iid}"
+        self.path = STATE_DIR / f"{state_key(repo, host, iid)}.json"
+        state = self.load()
+        # First run for this MR: record what exists and report nothing.
+        self.baseline = state is None
+        self.state: Json = state or {"reported": [], "summaries": {}, "base_oid": None, "merge_status": None}
+        self.reported: set[str] = set(self.state["reported"])
+        self.printed: set[str] = set()
+        self.events = 0
+        self.settings: Json | None = None
+        self.viewer: str | None = None
+        self.prev_snapshot: list[Any] | None = None
+        self.no_pipeline_polls = 0
+        self.mr_files: dict[str, set[str]] = {}
+
+    def load(self) -> Json | None:
+        try:
+            if time.time() - self.path.stat().st_mtime > STALE_STATE_SECONDS:
+                return None
+            return json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def save(self) -> None:
+        self.state["reported"] = sorted(self.reported)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.state))
+        tmp.replace(self.path)
+
+    def say(self, line: str) -> None:
+        if line not in self.printed:
+            self.printed.add(line)
+            print(f"!{self.iid} {line}", flush=True)
+
+    def emit(self, key: str, line: str) -> None:
+        """Print an event once per MR, across restarts."""
+        if key in self.reported:
+            return
+        self.reported.add(key)
+        if not self.baseline:
+            self.events += 1
+            self.say(line)
+
+    def finish(self, code: int, lines: Sequence[str] = ()) -> NoReturn:
+        for line in lines:
+            self.say(line)
+        self.save()
+        sys.exit(code)
+
+    def api(self, endpoint: str) -> Any:
+        return glab_api(endpoint, self.host)
+
+    def pages(self, endpoint: str) -> list[Json]:
+        joiner = "&" if "?" in endpoint else "?"
+        rows: list[Json] = []
+        for page in range(1, 51):
+            batch = self.api(f"{endpoint}{joiner}per_page={PER_PAGE}&page={page}")
+            rows.extend(batch)
+            if len(batch) < PER_PAGE:
+                break
+        return rows
+
+    def optional(self, endpoint: str, default: Any) -> Any:
+        """Endpoints that some tiers or versions lack (approvals, reviewers)."""
+        try:
+            return self.api(endpoint)
+        except GlabError as error:
+            if error.transient:
+                raise
+            return default
+
+    def setup(self) -> None:
+        project = self.api(self.project)
+        self.settings = project
+        self.viewer = self.api("user").get("username")
+        rules = [
+            f"merge method {project.get('merge_method', 'merge')}",
+            "pipeline must succeed" if project.get("only_allow_merge_if_pipeline_succeeds") else "pipeline optional",
+            "threads must be resolved" if project.get("only_allow_merge_if_all_discussions_are_resolved") else "threads optional",
+        ]
+        log(f"watching {self.repo}!{self.iid} until {self.until}; {', '.join(rules)}")
+
+    def head_pushed_at(self, head: str) -> float:
+        """When the diff version for the head commit appeared, which is about when it was pushed."""
+        versions = self.optional(f"{self.mr_path}/versions", [])
+        return next((stamp(v.get("created_at")) for v in versions if v.get("head_commit_sha") == head), 0.0)
+
+    def head_pipeline(self, mr: Json, head: str, pushed_at: float) -> Json | None:
+        pipeline = mr.get("head_pipeline") or mr.get("pipeline")
+        if not pipeline:
+            return None
+        if str(pipeline.get("ref", "")).startswith("refs/merge-requests/"):
+            # Merged results and merge request pipelines: compare times, not SHAs.
+            if pushed_at and stamp(pipeline.get("created_at")) < pushed_at - PUSH_SKEW_SECONDS:
+                return None
+            return pipeline
+        return pipeline if pipeline.get("sha") == head else None
+
+    def fetch_jobs(self, pipeline: Json) -> dict[str, Json]:
+        jobs: dict[str, Json] = {}
+        for job in self.pages(f"{self.project}/pipelines/{pipeline['id']}/jobs"):
+            current = jobs.get(job["name"])
+            # A retried job appears twice. The newer run wins.
+            if current is None or job["id"] > current["id"]:
+                jobs[job["name"]] = job
+        return jobs
+
+    def mr_overlap(self, head: str, old: str, new: str) -> list[str]:
+        """Files this MR touches that the new target commits also touch."""
+        try:
+            if head not in self.mr_files:
+                try:
+                    diffs = self.pages(f"{self.mr_path}/diffs")
+                except GlabError as error:
+                    if error.transient:
+                        raise
+                    diffs = self.api(f"{self.mr_path}/changes").get("changes", [])  # before GitLab 15.7
+                self.mr_files[head] = {d[k] for d in diffs for k in ("new_path", "old_path") if d.get(k)}
+            moved = self.api(f"{self.project}/repository/compare?from={old}&to={new}").get("diffs", [])
+        except GlabError as error:
+            log(f"could not compare target commits: {error}")
+            return []
+        touched = {d[k] for d in moved for k in ("new_path", "old_path") if d.get(k)}
+        return sorted(self.mr_files[head] & touched)
+
+    def poll(self) -> None:
+        if self.settings is None:
+            self.setup()
+        settings = self.settings or {}
+        mr = self.api(f"{self.mr_path}?include_diverged_commits_count=true")
+        url = mr["web_url"]
+        if mr["state"] == "merged":
+            self.finish(0, [f"merged: {url}"])
+        if mr["state"] in ("closed", "locked"):
+            self.finish(1, [f"closed without merging: {url}"])
+
+        head = mr["sha"]
+        short = head[:7]
+        target = mr["target_branch"]
+        mine = {(mr.get("author") or {}).get("username"), self.viewer}
+        pushed_at = self.head_pushed_at(head)
+        pipeline = self.head_pipeline(mr, head, pushed_at)
+        jobs = self.fetch_jobs(pipeline) if pipeline else {}
+        discussions = self.pages(f"{self.mr_path}/discussions")
+        self.events = 0
+
+        # The pipeline. Its status is the gate; jobs only explain it.
+        ci_jobs = {name: j for name, j in jobs.items() if not bot_name(name)}
+        if pipeline:
+            self.no_pipeline_polls = 0
+            ci = pipeline["status"]
+        else:
+            self.no_pipeline_polls += 1
+            requires = settings.get("only_allow_merge_if_pipeline_succeeds")
+            ci = "none" if self.no_pipeline_polls >= NO_PIPELINE_POLLS and not requires else "pending"
+        fail_lines: list[str] = []
+        if ci in FAILED:
+            for name, job in sorted(ci_jobs.items()):
+                if job["status"] in FAILED and not job.get("allow_failure"):
+                    fail_lines.append(f"job failed: {name} {job.get('web_url', '')}".rstrip())
+                    self.emit(f"fail:{head}:{job['id']}", fail_lines[-1])
+            if not fail_lines:
+                fail_lines.append(f"pipeline {ci}: {pipeline.get('web_url', '')}".rstrip())
+                self.emit(f"fail:{head}:{pipeline['id']}", fail_lines[-1])
+        manual = sorted(name for name, j in ci_jobs.items() if j["status"] == "manual" and not j.get("allow_failure"))
+        ci_done = ci in PASSED or ci in FAILED or ci in BLOCKED or ci == "none"
+        # Pipelines and jobs appear a few seconds after a push. Two identical
+        # polls in a row guard against calling a half-created pipeline finished.
+        snapshot = [ci, (pipeline or {}).get("id"), sorted((n, j["status"]) for n, j in jobs.items())]
+        stable = snapshot == self.prev_snapshot
+        self.prev_snapshot = snapshot
+        green = (ci in PASSED or ci == "none") and stable
+
+        # People and bots talking. Edits and system notes are never events.
+        unresolved: list[str] = []
+        bot_notes: dict[str, list[tuple[Json, bool]]] = {}
+        for discussion in discussions:
+            notes = [n for n in discussion.get("notes", []) if not n.get("system")]
+            if not notes:
+                continue
+            if any(n.get("resolvable") and not n.get("resolved") for n in notes):
+                unresolved.append(f"{url}#note_{notes[0]['id']}")
+            position = notes[0].get("position") or {}
+            path = position.get("new_path") or position.get("old_path")
+            line = position.get("new_line") or position.get("old_line")
+            where = f" on {path}:{line}" if path and line else f" on {path}" if path else ""
+            for index, note in enumerate(notes):
+                login, name = who(note)
+                bot = note_bot(note)
+                if bot:
+                    bot_notes.setdefault(bot, []).append((note, index == 0))
+                if login in mine:
+                    continue
+                link = f"{url}#note_{note['id']}"
+                if discussion.get("individual_note"):
+                    if bot or any(b in login.lower() or b in name.lower() for b in STATUS_BOTS):
+                        continue
+                    self.emit(f"c:{note['id']}", f"comment from {login}: {snippet(note['body'])} {link}")
+                else:
+                    kind = "new thread" if index == 0 else "thread reply"
+                    self.emit(f"c:{note['id']}", f"{kind} from {login}{where}: {snippet(note['body'])} {link}")
+
+        # Approvals and requested changes.
+        approvals = self.optional(f"{self.mr_path}/approvals", {})
+        for row in approvals.get("approved_by") or []:
+            login = (row.get("user") or {}).get("username")
+            if login and login not in mine:
+                self.emit(f"approved:{login}:{head}", f"approved by {login} {url}")
+        for row in self.optional(f"{self.mr_path}/reviewers", []):
+            login = (row.get("user") or {}).get("username")
+            if login and login not in mine and row.get("state") == "requested_changes":
+                self.emit(f"changes:{login}:{head}", f"review from {login} (requested changes) {url}")
+
+        # Review bots on the current head. A bot with jobs is done when they
+        # finish. Otherwise it is done once a diff note sits on the head commit,
+        # a summary names the head, or it posted after the head was pushed.
+        bot_status: dict[str, str] = {}
+        reviewed: list[str] = []
+        for bot in [*GATING_BOTS, *ADVISORY_BOTS]:
+            own_jobs = {name: j for name, j in jobs.items() if bot_name(name) == bot}
+            own = bot_notes.get(bot, [])
+            summaries = [note for note, first in own if first and not note.get("position")]
+            if own_jobs:
+                done = all(j["status"] not in ("created", "pending", "running") for j in own_jobs.values())
+            else:
+                done = any(
+                    (note.get("position") or {}).get("head_sha") == head
+                    or short in (note.get("body") or "")
+                    or (first and pushed_at and stamp(note.get("created_at")) >= pushed_at)
+                    for note, first in own
+                )
+            seen = bool(own_jobs or own)
+            advisory = bot in ADVISORY_BOTS
+            if seen:
+                bot_status[bot] = f"{bot} {'done' if done else 'pending'}{' (advisory)' if advisory else ''}"
+            key = f"bot:{bot}:{head}"
+            was_done = key in self.reported
+            if done:
+                if not advisory:
+                    reviewed.append(bot)
+                failed = [name for name, j in own_jobs.items() if j["status"] in FAILED]
+                detail = "; ".join(filter(None, [
+                    next((v for v in (verdict(s["body"]) for s in summaries) if v), ""),
+                    f"failed: {', '.join(failed)}" if failed else "",
+                ]))
+                tag = " (advisory, not waited on)" if advisory else ""
+                self.emit(key, f"{bot} finished on {short}{': ' + detail if detail else ''}{tag}")
+            if not advisory:
+                for s in summaries:
+                    sid = str(s["id"])
+                    new, old = digest(s["body"]), self.state["summaries"].get(sid)
+                    self.state["summaries"][sid] = new
+                    if was_done and old and old != new:
+                        text = verdict(s["body"]) or snippet(s["body"])
+                        self.emit(f"summary:{sid}:{new}", f"{bot} summary changed on {short}: {text} {url}#note_{sid}")
+
+        # Target branch and merge status.
+        try:
+            branch = self.api(f"{self.project}/repository/branches/{quote(target, safe='')}")
+            base_oid = (branch.get("commit") or {}).get("id")
+        except GlabError as error:
+            if error.transient:
+                raise
+            log(f"could not read {target}: {error}")
+            base_oid = None
+        old_base = self.state["base_oid"]
+        if base_oid and old_base and base_oid != old_base and not self.baseline:
+            touched = self.mr_overlap(head, old_base, base_oid)
+            if touched:
+                more = f" and {len(touched) - 5} more" if len(touched) > 5 else ""
+                self.emit(
+                    f"base:{base_oid}",
+                    f"{target} moved to {base_oid[:7]} and touches files in this MR: {', '.join(touched[:5])}{more}",
+                )
+        if base_oid:
+            self.state["base_oid"] = base_oid
+        status = mr.get("detailed_merge_status") or mr.get("merge_status") or "unchecked"
+        conflict = bool(mr.get("has_conflicts")) or status in ("conflict", "cannot_be_merged")
+        rebase = status == "need_rebase"
+        conflict_line = f"MR conflicts with {target}: rebase it"
+        rebase_line = f"GitLab requires a rebase onto {target} before merging (`glab mr rebase {self.iid}`)"
+        if status not in ("unchecked", "checking"):
+            if conflict and self.state["merge_status"] != "conflict":
+                self.emit(f"merge:conflict:{head}:{base_oid}", conflict_line)
+            elif rebase and self.state["merge_status"] != "need_rebase":
+                self.emit(f"merge:need_rebase:{head}:{base_oid}", rebase_line)
+            self.state["merge_status"] = "conflict" if conflict else status
+
+        # One summary line per head once the pipeline finishes.
+        counts: dict[str, int] = {}
+        for job in ci_jobs.values():
+            counts[job["status"]] = counts.get(job["status"], 0) + 1
+        failed_names = sorted(n for n, j in ci_jobs.items() if j["status"] in FAILED)
+        behind = mr.get("diverged_commits_count")
+        parts = [
+            f"pipeline {ci}" + (
+                f" ({', '.join(f'{n} {s}' for s, n in sorted(counts.items()))})" if counts else ""
+            ) + (f" failed: {', '.join(failed_names)}" if failed_names else ""),
+            ", ".join(bot_status[b] for b in [*GATING_BOTS, *ADVISORY_BOTS] if b in bot_status)
+            or "no Greptile or Duo yet",
+            f"{len(unresolved)} unresolved threads",
+            f"approvals left {approvals['approvals_left']}" if approvals.get("approvals_left") else "",
+            "draft" if mr.get("draft") or mr.get("work_in_progress") else "",
+            f"merge status {status}",
+        ]
+        summary = "; ".join(p for p in parts if p)
+        behind_note = f"; {behind} commit{'' if behind == 1 else 's'} behind {target}" if behind else ""
+        checks_key = f"checks:{head}"
+
+        # Decide whether to stop. A green or ready line carries the same summary
+        # as the pipeline line, so it marks that event as reported.
+        if self.until != "any-change":
+            if conflict:
+                self.finish(1, [conflict_line])
+            if fail_lines:
+                self.finish(1, fail_lines)
+            if ci in BLOCKED and stable:
+                names = ", ".join(manual) or "a manual job"
+                self.finish(1, [f"pipeline waits on {names} on {short}: run it with `glab ci trigger <job-id>` if that is safe"])
+            if green and self.until == "green":
+                self.reported.add(checks_key)
+                self.finish(0, [f"green on {short}: {summary}{behind_note}"])
+            # ready waits for Greptile or Duo, never for CodeRabbit.
+            if green and reviewed:
+                if unresolved:
+                    self.finish(1, [f"blocked by {len(unresolved)} unresolved threads on {short}: {' '.join(unresolved)}"])
+                if rebase:
+                    self.finish(1, [rebase_line])
+                self.reported.add(checks_key)
+                self.finish(0, [f"ready on {short}: {summary}{behind_note}"])
+        if ci_done and ci != "none" and (stable or self.baseline):
+            self.emit(checks_key, f"pipeline finished on {short}: {summary}")
+        if self.until == "any-change" and self.events:
+            self.finish(0)
+
+    def run(self) -> NoReturn:
+        failures = 0
+        while True:
+            try:
+                self.poll()
+                failures = 0
+            except GlabError as error:
+                if not error.transient:
+                    self.finish(1, [f"mr-wait stopped: {error}"])
+                failures += 1
+                log(f"poll failed ({failures}/{MAX_FAILED_POLLS}): {error}")
+                if failures >= MAX_FAILED_POLLS:
+                    self.finish(1, [f"mr-wait stopped: GitLab unreachable for {failures} polls: {error}"])
+            else:
+                self.save()
+                if self.baseline:
+                    log(f"baseline recorded for {self.repo}!{self.iid}; reporting only new events")
+                self.baseline = False
+            time.sleep(self.interval)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="mr-wait", description="Watch a GitLab MR and print one line per real event.")
+    parser.add_argument("mr", nargs="?", help="MR number or URL")
+    parser.add_argument("--repo", help="group/project (default: from the URL or the current checkout)")
+    parser.add_argument("--hostname", help="GitLab host (default: from the URL or glab's default)")
+    parser.add_argument("--until", choices=("green", "ready", "any-change"), default="ready")
+    parser.add_argument("--interval", type=int, default=20, help="seconds between polls (default 20, min 5)")
+    args = parser.parse_args()
+    repo, host, iid = parse_target(args.mr, args.repo, args.hostname)
+    _lock = lock(state_key(repo, host, iid), f"{repo}!{iid}")
+    Watcher(repo, host, iid, args.until, max(args.interval, 5)).run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

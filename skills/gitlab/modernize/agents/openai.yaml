@@ -1,0 +1,4 @@
+interface:
+  display_name: "Modernize MR"
+  short_description: "Rebase and reassess an aging merge request"
+  default_prompt: "Use $modernize to rebase this MR on its current target branch, check for conceptual conflicts, and tell me honestly whether it should stay open."

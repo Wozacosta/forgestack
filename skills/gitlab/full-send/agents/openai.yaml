@@ -1,0 +1,4 @@
+interface:
+  display_name: "Full Send"
+  short_description: "Prove, file, babysit, and merge a GitLab MR unattended"
+  default_prompt: "Use $full-send to take this to a merged MR. I am not watching this thread."
